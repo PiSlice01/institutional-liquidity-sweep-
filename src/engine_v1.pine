@@ -1,152 +1,113 @@
 //@version=5
-strategy("V1 Engine - 1H Zone + 30m Sweep", shorttitle="V1_Engine_1H_30M", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=0.00005, slippage=2)
+strategy("Institutional Liquidity Sweep Engine V2", 
+     overlay=true, 
+     initial_capital=1000, 
+     default_qty_type=strategy.cash, 
+     default_qty_value=20, 
+     currency=currency.USD, 
+     slippage=3, 
+     commission_type=strategy.commission.cash_per_contract, 
+     commission_value=0.07, 
+     max_bars_back=500)
 
-// ==========================================
-// 1. INPUT PARAMETERS & CONFIGURATION
-// ==========================================
+// =============================================================================
+// 1. INPUT PARAMETERS & USER CONFIGURATION
+// =============================================================================
+var string G_STRAT   = "Strategy Parameters"
+var string G_FILTER  = "Trend & Volatility Filters"
+var string G_RISK    = "Risk Management"
 
-// --- Higher Timeframe (1H) Zone Settings ---
-group_htf           = "1H Zone Configuration"
-htf_timeframe       = input.timeframe("60", "Higher Timeframe", group=group_htf)
-htf_swing_lookback  = input.int(10, "1H Zone Lookback Window", group=group_htf)
+// Strategy Inputs
+i_targetRR       = input.float(2.50, "Target Risk-to-Reward (R:R)", group=G_STRAT, tooltip="Target R:R limit before friction haircuts")
+i_lookback       = input.int(10, "Sweep Lookback Bars (30m)", minval=5, maxval=50, group=G_STRAT)
+i_wickRatio      = input.float(0.35, "Min Sweep Wick Ratio", minval=0.1, maxval=0.8, group=G_STRAT)
 
-// --- Lower Timeframe (30m) Sweep Settings ---
-group_sweep         = "30m Liquidity Sweep Settings"
-wick_ratio_threshold= input.float(0.35, "Minimum Sweep Wick Ratio (% Candle)", group=group_sweep)
+// Trend & Volatility Inputs
+i_useTrendFilter = input.bool(true, "Enable HTF Trend Filter (4H 50 / 1H 200 EMA)", group=G_FILTER)
+i_useAtrGate     = input.bool(true, "Enable Volatility Expansion Gate (ATR > SMA)", group=G_FILTER)
+i_atrMultiplier  = input.float(1.0, "ATR Volatility Multiplier Threshold", minval=0.5, step=0.1, group=G_FILTER)
 
-// --- Session & Time Gating Inputs ---
-group_session       = "Session Gating"
-use_session_filter  = input.bool(true, "Enable Session Filter", group=group_session)
-allowed_session     = input.session("0300-1200:23456", "Allowed Window (UTC-5 / EST)", group=group_session) // London / NY Overlap
+// Risk Inputs
+i_riskUSD        = input.float(20.0, "Fixed Dollar Risk ($)", minval=1.0, group=G_RISK)
+i_maxDailyLoss   = input.float(40.0, "Hard Daily Drawdown Breaker ($)", minval=5.0, group=G_RISK)
 
-// --- Risk Management Inputs ---
-group_risk          = "Risk & Order Management"
-risk_percent        = input.float(1.0, "Risk Per Trade (% Equity)", minval=0.1, maxval=5.0, group=group_risk) / 100
-rr_ratio            = input.float(2.0, "Risk-to-Reward Ratio", minval=1.0, group=group_risk)
+// =============================================================================
+// 2. INDICATORS & HTF SECURITY FETCH
+// =============================================================================
+// Non-repainting HTF Trend EMAs
+ema4H_50  = request.security(syminfo.tickerid, "240", ta.ema(close, 50)[1], barmerge.gaps_off, barmerge.lookahead_off)
+ema1H_200 = request.security(syminfo.tickerid, "60", ta.ema(close, 200)[1], barmerge.gaps_off, barmerge.lookahead_off)
 
-// ==========================================
-// 2. MULTI-TIMEFRAME (1H) ZONE DATA RETRIEVAL
-// ==========================================
+// Volatility Expansion Calculation (30m)
+atrVal    = ta.atr(14)
+atrSmaVal = ta.sma(atrVal, 20)
+isVolatile = not i_useAtrGate or (atrVal >= atrSmaVal * i_atrMultiplier)
 
-// Fetch 1H Swing High and Swing Low levels without look-ahead bias
-htf_high = request.security(syminfo.tickerid, htf_timeframe, ta.highest(high, htf_swing_lookback)[1], barmerge.gaps_off, barmerge.lookahead_off)
-htf_low  = request.security(syminfo.tickerid, htf_timeframe, ta.lowest(low, htf_swing_lookback)[1], barmerge.gaps_off, barmerge.lookahead_off)
+// Market Structure Lookbacks (30m)
+highLevel = ta.highest(high, i_lookback)[1]
+lowLevel  = ta.lowest(low, i_lookback)[1]
 
-// ==========================================
-// 3. 30M LIQUIDITY SWEEP DETECTION LOGIC
-// ==========================================
+// =============================================================================
+// 3. DAILY CIRCUIT BREAKER & SESSION FILTERS
+// =============================================================================
+// Track Daily Realized Equity for Hard Loss Limit
+var float dailyStartEquity = strategy.equity
+if ta.change(time("D"))
+    dailyStartEquity := strategy.equity
 
-// 30m Candle metrics
-candle_range = high - low
-upper_wick   = high - math.max(open, close)
-lower_wick   = math.min(open, close) - low
+dailyDrawdown  = dailyStartEquity - strategy.equity
+isDailyBlocked = dailyDrawdown >= i_maxDailyLoss
 
-// Bullish Sweep of 1H Demand/Low Zone:
-// Price drops below 1H Low on 30m, but closes back above it with a strong lower wick
-bullish_sweep = (low < htf_low) and (close > htf_low) and (lower_wick >= candle_range * wick_ratio_threshold)
+// Session Definition (Adjusted for European/NY Overlap and Tokyo)
+isSession = not na(time(timeframe.period, "0600-1700:23456")) or not na(time(timeframe.period, "1900-1500:12345"))
 
-// Bearish Sweep of 1H Supply/High Zone:
-// Price pushes above 1H High on 30m, but closes back below it with a strong upper wick
-bearish_sweep = (high > htf_high) and (close < htf_high) and (upper_wick >= candle_range * wick_ratio_threshold)
+// =============================================================================
+// 4. SIGNAL GENERATION LOGIC
+// =============================================================================
+candleRange = high - low
+lowerWick   = math.min(open, close) - low
+upperWick   = high - math.max(open, close)
 
-// ==========================================
-// 4. SESSION FILTER & ENTRY CONDITIONS
-// ==========================================
+// Bullish Sweep: Price pierces 30m low, rejects back above, wick >= 35% of body
+bullishSweep = (low < lowLevel) and (close > lowLevel) and (lowerWick >= candleRange * i_wickRatio)
 
-// Validate active trading session
-in_session = use_session_filter ? not na(time(timeframe.period, allowed_session)) : true
+// Bearish Sweep: Price pierces 30m high, rejects back below, wick >= 35% of body
+bearishSweep = (high > highLevel) and (close < highLevel) and (upperWick >= candleRange * i_wickRatio)
 
-// Final Entry Triggers (Must be in session & forming on 30m timeframe)
-long_condition  = in_session and bullish_sweep
-short_condition = in_session and bearish_sweep
+// HTF Trend Alignment Checks
+trendBullish = not i_useTrendFilter or (close > ema4H_50 and close > ema1H_200)
+trendBearish = not i_useTrendFilter or (close < ema4H_50 and close < ema1H_200)
 
-// ==========================================
-// 5. POSITION SIZING & RISK MANAGEMENT
-// ==========================================
+// Final Execution Triggers
+longCondition  = bullishSweep and trendBullish and isVolatile and isSession and not isDailyBlocked
+shortCondition = bearishSweep and trendBearish and isVolatile and isSession and not isDailyBlocked
 
-atr_30m = ta.atr(14)
+// =============================================================================
+// 5. DYNAMIC POSITION SIZING & ORDER EXECUTION
+// =============================================================================
+if (longCondition and strategy.position_size == 0)
+    stopDistance = close - low
+    if stopDistance > 0
+        units = i_riskUSD / (stopDistance * syminfo.pointvalue)
+        takeProfitPrice = close + (stopDistance * i_targetRR)
+        stopLossPrice   = low
+        strategy.entry("Sweep Long", strategy.long, qty=units)
+        strategy.exit("Exit Long", "Sweep Long", limit=takeProfitPrice, stop=stopLossPrice)
 
-if (long_condition and strategy.position_size == 0)
-    stop_loss   = low - (atr_30m * 0.25) // Invalidation placed below 30m sweep wick
-    risk_dist   = close - stop_loss
-    take_profit = close + (risk_dist * rr_ratio)
-    
-    // Dynamic position sizing
-    position_units = (strategy.equity * risk_percent) / risk_dist
-    
-    strategy.entry("V1 Long", strategy.long, qty=position_units)
-    strategy.exit("Exit Long", "V1 Long", stop=stop_loss, limit=take_profit)
+if (shortCondition and strategy.position_size == 0)
+    stopDistance = high - close
+    if stopDistance > 0
+        units = i_riskUSD / (stopDistance * syminfo.pointvalue)
+        takeProfitPrice = close - (stopDistance * i_targetRR)
+        stopLossPrice   = high
+        strategy.entry("Sweep Short", strategy.short, qty=units)
+        strategy.exit("Exit Short", "Sweep Short", limit=takeProfitPrice, stop=stopLossPrice)
 
-if (short_condition and strategy.position_size == 0)
-    stop_loss   = high + (atr_30m * 0.25) // Invalidation placed above 30m sweep wick
-    risk_dist   = stop_loss - close
-    take_profit = close - (risk_dist * rr_ratio)
-    
-    // Dynamic position sizing
-    position_units = (strategy.equity * risk_percent) / risk_dist
-    
-    strategy.entry("V1 Short", strategy.short, qty=position_units)
-    strategy.exit("Exit Short", "V1 Short", stop=stop_loss, limit=take_profit)
+// =============================================================================
+// 6. VISUALIZATIONS
+// =============================================================================
+plot(i_useTrendFilter ? ema4H_50 : na, "4H 50 EMA", color=color.rgb(33, 150, 243), linewidth=2)
+plot(i_useTrendFilter ? ema1H_200 : na, "1H 200 EMA", color=color.rgb(233, 30, 99), linewidth=2)
 
-// ==========================================
-// 6. VISUAL OVERLAYS & CHART PLOTS
-// ==========================================
-
-// Plot 1H Key Zone Levels on the 30m chart
-plot(htf_high, "1H Supply Zone Level", color=color.red, linewidth=2, style=plot.style_stepline)
-plot(htf_low, "1H Demand Zone Level", color=color.green, linewidth=2, style=plot.style_stepline)
-
-// Signal Indicators
-plotshape(long_condition, title="Bullish 30m Sweep", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
-plotshape(short_condition, title="Bearish 30m Sweep", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
-////////// //////////
-//@version=5
-strategy("V1 Engine - 1H Zone + 30m Sweep", shorttitle="V1_Engine_1H_30M", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=0.00005, slippage=2)
-
-// --- Inputs ---
-htf_timeframe       = input.timeframe("60", "Higher Timeframe (1H)")
-htf_swing_lookback  = input.int(10, "1H Zone Lookback Window")
-wick_ratio_threshold= input.float(0.35, "Minimum Sweep Wick Ratio")
-use_session_filter  = input.bool(true, "Enable Session Filter")
-allowed_session     = input.session("0300-1200:23456", "Allowed Window (EST)")
-risk_percent        = input.float(1.0, "Risk Per Trade (%)") / 100
-rr_ratio            = input.float(2.0, "Risk-to-Reward Ratio")
-
-// --- HTF Data Retrieval ---
-htf_high = request.security(syminfo.tickerid, htf_timeframe, ta.highest(high, htf_swing_lookback)[1], barmerge.gaps_off, barmerge.lookahead_off)
-htf_low  = request.security(syminfo.tickerid, htf_timeframe, ta.lowest(low, htf_swing_lookback)[1], barmerge.gaps_off, barmerge.lookahead_off)
-// --- 30m Sweep Logic ---
-candle_range = high - low
-upper_wick   = high - math.max(open, close)
-lower_wick   = math.min(open, close) - low
-
-bullish_sweep = (low < htf_low) and (close > htf_low) and (lower_wick >= candle_range * wick_ratio_threshold)
-bearish_sweep = (high > htf_high) and (close < htf_high) and (upper_wick >= candle_range * wick_ratio_threshold)
-
-// --- Execution & Sizing ---
-in_session     = use_session_filter ? not na(time(timeframe.period, allowed_session)) : true
-long_condition  = in_session and bullish_sweep
-short_condition = in_session and bearish_sweep
-atr_30m         = ta.atr(14)
-
-if (long_condition and strategy.position_size == 0)
-    stop_loss   = low - (atr_30m * 0.25)
-    risk_dist   = close - stop_loss
-    take_profit = close + (risk_dist * rr_ratio)
-    position_units = (strategy.equity * risk_percent) / risk_dist
-    strategy.entry("V1 Long", strategy.long, qty=position_units)
-    strategy.exit("Exit Long", "V1 Long", stop=stop_loss, limit=take_profit)
-
-if (short_condition and strategy.position_size == 0)
-    stop_loss   = high + (atr_30m * 0.25)
-    risk_dist   = stop_loss - close
-    take_profit = close - (risk_dist * rr_ratio)
-    position_units = (strategy.equity * risk_percent) / risk_dist
-    strategy.entry("V1 Short", strategy.short, qty=position_units)
-    strategy.exit("Exit Short", "V1 Short", stop=stop_loss, limit=take_profit)
-
-// --- Visual Overlays ---
-plot(htf_high, "1H Supply Zone", color=color.red, linewidth=2, style=plot.style_stepline)
-plot(htf_low, "1H Demand Zone", color=color.green, linewidth=2, style=plot.style_stepline)
-plotshape(long_condition, title="Bullish Sweep", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
-plotshape(short_condition, title="Bearish Sweep", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+plotshape(longCondition, "Long Sweep Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(shortCondition, "Short Sweep Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
